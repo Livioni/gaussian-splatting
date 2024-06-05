@@ -9,12 +9,12 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import os
-import sys
+import os,math
+import sys,torch
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
-    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
+    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text, read_extrinsics_binary_vast, read_intrinsics_binary_vast
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
@@ -41,6 +41,27 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+
+def create_man_rans(position, rotation):
+    
+    # The angle is reversed because the counterclockwise direction is defined as negative in three.js
+    rot_x = np.array([[1, 0, 0],
+                      [0, math.cos(np.deg2rad(-rotation[0])), -math.sin(np.deg2rad(-rotation[0]))],
+                      [0, math.sin(np.deg2rad(-rotation[0])),  math.cos(np.deg2rad(-rotation[0]))]])
+    rot_y = np.array([[ math.cos(np.deg2rad(-rotation[1])), 0, math.sin(np.deg2rad(-rotation[1]))],
+                      [0, 1, 0],
+                      [-math.sin(np.deg2rad(-rotation[1])), 0, math.cos(np.deg2rad(-rotation[1]))]])
+    rot_z = np.array([[math.cos(np.deg2rad(-rotation[2])), -math.sin(np.deg2rad(-rotation[2])), 0],
+                      [math.sin(np.deg2rad(-rotation[2])),  math.cos(np.deg2rad(-rotation[2])), 0],
+                      [0, 0, 1]])
+
+    rot = rot_z @ rot_y @ rot_x
+    man_trans = np.zeros((4, 4))
+    man_trans[:3, :3] = rot.transpose()
+    man_trans[:3, -1] = np.array(position).transpose()
+    man_trans[3, 3] = 1
+        
+    return man_trans
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -95,6 +116,56 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(image_path).split(".")[0]
+        image = Image.open(image_path)
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_infos.append(cam_info)
+    sys.stdout.write('\n')
+    return cam_infos
+
+def readColmapCamerasVast(cam_extrinsics, cam_intrinsics, images_folder):
+    cam_infos = []
+    man_trans = create_man_rans((0,0,0),(0,21,0))
+    for idx, key in enumerate(cam_extrinsics):
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+        sys.stdout.flush()
+
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        uid = intr.id
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+        
+        W2C = np.zeros((4, 4))
+        W2C[:3, :3] = R.transpose()
+        W2C[:3, -1] = T
+        W2C[3, 3] = 1.0
+        W2nC = W2C @ np.linalg.inv(man_trans)   # 相机跟着点云旋转平移后得到新的相机坐标系nC
+
+        R = W2nC[:3, :3]
+        R = R.transpose()
+        T = W2nC[:3, -1]
+
+        if intr.model=="SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model=="PINHOLE":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        image_path = os.path.join(images_folder, 'train', os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
@@ -168,6 +239,45 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         pcd = fetchPly(ply_path)
     except:
         pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+
+def readColmapSceneInfoVast(path, client_path, images, eval, llffhold=8):
+    client_index = client_path.split("/")[-1]
+    client_txt_path = os.path.join(path, client_index, f"{client_index}.txt")
+    with open(client_txt_path, 'r') as file:
+        # 读取文件的每一行，并将每一行的末尾换行符去掉
+        lines = [line.strip() for line in file]
+
+    cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+    cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+    cam_extrinsics = read_extrinsics_binary_vast(cameras_extrinsic_file, lines)
+    cam_intrinsics = read_intrinsics_binary_vast(cameras_intrinsic_file, lines)
+
+
+    reading_dir = "images" if images == None else images
+    cam_infos_unsorted = readColmapCamerasVast(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    pcd_path = os.path.join(path, client_index, f"block_{client_index[-1:]}.pt")
+    pointcloud = torch.load(pcd_path)
+    pcd = BasicPointCloud(points=pointcloud['points'], colors=pointcloud['colors'], normals=pointcloud['normals'])
+    ply_path = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -256,5 +366,6 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
+    "ColmapVast": readColmapSceneInfoVast,
     "Blender" : readNerfSyntheticInfo
 }
