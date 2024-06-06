@@ -282,25 +282,25 @@ if __name__ == "__main__":
         client_pool = [i + trainin_round * j for j in range(cuda_devices)]
         
         # Debug
-        parallel_local_training(0, 0, lp, op, pp,args.test_iterations, args.save_iterations,
-                                args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+        # parallel_local_training(0, 0, lp, op, pp,args.test_iterations, args.save_iterations,
+        #                         args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
         
-    #     processes = []
-    #     for index, device_id in enumerate(range(cuda_devices)):
-    #         client_index = client_pool[index]
-    #         p = Process(target=parallel_local_training, name = f"Client_{client_index}",
-    #                 args=(device_id, client_index, lp, op, pp,
-    #                       args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-    #                       args.start_checkpoint, args.debug_from))
-    #         processes.append(p)
-    #         p.start()
+        processes = []
+        for index, device_id in enumerate(range(cuda_devices)):
+            client_index = client_pool[index]
+            p = Process(target=parallel_local_training, name = f"Client_{client_index}",
+                    args=(device_id, client_index, lp, op, pp,
+                          args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+                          args.start_checkpoint, args.debug_from))
+            processes.append(p)
+            p.start()
         
-    #     for p in processes:
-    #         p.join()  # 等待所有进程完成
-    #         processes = []
+        for p in processes:
+            p.join()  # 等待所有进程完成
+            processes = []
             
-    #     torch.cuda.empty_cache()
-    #     print("###############################################")
+        torch.cuda.empty_cache()
+        print("###############################################")
     
 
-    # print("\nTraining complete.")
+    print("\nTraining complete.")
