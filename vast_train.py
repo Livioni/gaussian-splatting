@@ -25,6 +25,8 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import multiprocessing as mp
 from multiprocessing import Process
+from scene.dataset_readers import create_man_rans
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -234,7 +236,7 @@ def parallel_local_training(gpu_id, client_index, lp_args, op_args, pp_args, tes
     client_model_path = f"{model_path}/{client_index:05d}"
     lp_args.model_path = client_model_path
 
-    logger = setup_logging(client_index,file_path=client_model_path)
+    logger = setup_logging(client_index, file_path=client_model_path)
     # 启动训练
     logger.info("Starting process")
     training(lp_args, op_args, pp_args, test_iterations, save_iterations, checkpoint_iterations,start_checkpoint, debug_from, logger = logger)
@@ -246,8 +248,6 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    # parser.add_argument('--ip', type=str, default="127.0.0.1")
-    # parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(100, 60001, 500)))
@@ -256,16 +256,19 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--clients", type=int, default = 12)
+    parser.add_argument("--pos", nargs=3, type=float)       # 点云平移
+    parser.add_argument("--rot", nargs=3, type=float)       # 点云平移
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    lp, op, pp = lp.extract(args), op.extract(args), pp.extract(args)
+    man_trans = create_man_rans(args.pos, args.rot)
+    lp.man_trans = man_trans
     
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     mp.set_start_method('spawn', force=True)
@@ -275,41 +278,29 @@ if __name__ == "__main__":
     trainin_round = args.clients // cuda_devices
             
     # Main Loops
-    for epoch in range(1):
-        print(f"Start training epoch {epoch}")
+    for i in range(trainin_round):
+        client_pool = [i + trainin_round * j for j in range(cuda_devices)]
+        
+        # Debug
+        parallel_local_training(0, 0, lp, op, pp,args.test_iterations, args.save_iterations,
+                                args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+        
+    #     processes = []
+    #     for index, device_id in enumerate(range(cuda_devices)):
+    #         client_index = client_pool[index]
+    #         p = Process(target=parallel_local_training, name = f"Client_{client_index}",
+    #                 args=(device_id, client_index, lp, op, pp,
+    #                       args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+    #                       args.start_checkpoint, args.debug_from))
+    #         processes.append(p)
+    #         p.start()
+        
+    #     for p in processes:
+    #         p.join()  # 等待所有进程完成
+    #         processes = []
             
-        for i in range(trainin_round):
-            client_index_1 = i
-            client_index_2 = trainin_round + i
-            
-            # Debug
-            # parallel_local_training(0, client_index_1, lp.extract(args), op.extract(args), pp.extract(args),
-            #                         args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-            #                         args.start_checkpoint, args.debug_from)
-            
-            processes = []
-            p1 = Process(target=parallel_local_training, name = f"Client_{client_index_1}",
-                        args=(0, client_index_1, lp.extract(args), op.extract(args), pp.extract(args),
-                              args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-                              args.start_checkpoint, args.debug_from))
-            
-            p2 = Process(target=parallel_local_training, name = f"Client_{client_index_2}",
-                        args=(1, client_index_2, lp.extract(args), op.extract(args), pp.extract(args),
-                              args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-                              args.start_checkpoint, args.debug_from))
-                                
-            p1.start()
-            p2.start()
-
-            processes.append(p1)
-            processes.append(p2)
-            
-            for p in processes:
-                p.join()
-                    
-            torch.cuda.empty_cache()
-            print("local client {} and {} training finished".format(client_index_1, client_index_2))
-            print("###############################################")
+    #     torch.cuda.empty_cache()
+    #     print("###############################################")
     
 
-    print("\nTraining complete.")
+    # print("\nTraining complete.")

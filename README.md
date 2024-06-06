@@ -1,5 +1,6 @@
 ## logs
 - 2024.06.05-0 初始化3DGS
+- 2024.06.06-0 复现VastGaussian 
 
 ## Scripts
 
