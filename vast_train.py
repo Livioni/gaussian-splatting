@@ -16,7 +16,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene_Vast, GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -26,6 +26,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import multiprocessing as mp
 from multiprocessing import Process
 from scene.dataset_readers import create_man_rans
+from LightGasussian.prune import prune_list, calculate_v_imp_score
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -37,7 +38,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    scene = Scene_Vast(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -95,8 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         
         if viewpoint_cam.is_val: # remove right-side pixels
-            gt_image = gt_image[..., :gt_image.shape[-1]//2]
-            image = image[..., :image.shape[-1]//2]
+            continue
         
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -133,7 +133,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                    
+            if iteration in opt.prune_iterations:
+                print("Before prune iteration, number of gaussians: " + str(len(gaussians.get_xyz)))
+                i = opt.prune_iterations.index(iteration)
+                gaussian_list, imp_list = prune_list(gaussians, scene, pipe, background)
 
+                if opt.prune_type == "important_score":
+                    gaussians.prune_gaussians(
+                        (opt.prune_decay**i) * opt.prune_percent, imp_list
+                    )
+                elif opt.prune_type == "v_important_score":
+                    # normalize scale
+                    v_list = calculate_v_imp_score(gaussians, imp_list, opt.v_pow)
+                    gaussians.prune_gaussians(
+                        (opt.prune_decay**i) * opt.prune_percent, v_list
+                    )
+                elif opt.prune_type == "max_v_important_score":
+                    v_list = imp_list * torch.max(gaussians.get_scaling, dim=1)[0]
+                    gaussians.prune_gaussians(
+                        (opt.prune_decay**i) * opt.prune_percent, v_list
+                    )
+                elif opt.prune_type == "count":
+                    gaussians.prune_gaussians(
+                        (opt.prune_decay**i) * opt.prune_percent, gaussian_list
+                    )
+                elif opt.prune_type == "opacity":
+                    gaussians.prune_gaussians(
+                        (opt.prune_decay**i) * opt.prune_percent,
+                        gaussians.get_opacity.detach(),
+                    )
+                else:
+                    raise Exception("Unsupportive pruning method")
+                
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -168,7 +200,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, logger = None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene_Vast, renderFunc, renderArgs, logger = None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -250,8 +282,8 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(100, 60001, 500)))
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000, 60_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(100, 10001, 500)))
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[10_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -278,29 +310,29 @@ if __name__ == "__main__":
     trainin_round = args.clients // cuda_devices
             
     # Main Loops
-    for i in range(trainin_round):
-        client_pool = [i + trainin_round * j for j in range(cuda_devices)]
+    # for i in range(trainin_round):
+    #     client_pool = [i + trainin_round * j for j in range(cuda_devices)]
         
         # Debug
-        # parallel_local_training(0, 0, lp, op, pp,args.test_iterations, args.save_iterations,
-        #                         args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    parallel_local_training(0, 0, lp, op, pp,args.test_iterations, args.save_iterations,
+                            args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
         
-        processes = []
-        for index, device_id in enumerate(range(cuda_devices)):
-            client_index = client_pool[index]
-            p = Process(target=parallel_local_training, name = f"Client_{client_index}",
-                    args=(device_id, client_index, lp, op, pp,
-                          args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-                          args.start_checkpoint, args.debug_from))
-            processes.append(p)
-            p.start()
+    #     processes = []
+    #     for index, device_id in enumerate(range(cuda_devices)):
+    #         client_index = client_pool[index]
+    #         p = Process(target=parallel_local_training, name = f"Client_{client_index}",
+    #                 args=(device_id, client_index, lp, op, pp,
+    #                       args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+    #                       args.start_checkpoint, args.debug_from))
+    #         processes.append(p)
+    #         p.start()
         
-        for p in processes:
-            p.join()  # 等待所有进程完成
-            processes = []
+    #     for p in processes:
+    #         p.join()  # 等待所有进程完成
+    #         processes = []
             
-        torch.cuda.empty_cache()
-        print("###############################################")
+    #     torch.cuda.empty_cache()
+    #     print("###############################################")
     
 
-    print("\nTraining complete.")
+    # print("\nTraining complete.")
